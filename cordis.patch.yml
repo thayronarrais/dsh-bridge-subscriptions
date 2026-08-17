@@ -1,0 +1,20 @@
+# Bundle patch for dsh-bridge-subscriptions, declared through `dsh.bundle.patch`
+# in package.json. `dsh plugin add` applies it as a profile layer over the base
+# profile; without it the package would install as a plain dependency and never
+# mount.
+#
+# One row, one plugin: every subscription bridge lives inside it and is switched
+# on or off through its own settings section, not by adding or removing rows.
+#
+# No `config` block here on purpose. A patch REPLACES the targeted row's whole
+# config rather than merging into it, so inlining defaults would freeze them
+# into the profile and shadow the `bridge-subscriptions:` section of
+# `$DSH_HOME/settings.yaml` — the section the web Models page writes. Leaving
+# the row bare lets the schema defaults apply and keeps settings authoritative.
+#
+# The same file also serves the development loop:
+#
+#   npx dsh web --patch ./cordis.patch.yml
+- insert:
+    - id: bridge-subscriptions
+      name: dsh-bridge-subscriptions
