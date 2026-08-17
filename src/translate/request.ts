@@ -15,6 +15,7 @@
  */
 
 import type { ContentBlock, Message } from '@deepseek-ai/dsh-llm'
+import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 
 /** Default prompt budget in bytes; generous, since the window is a million tokens. */
 export const DEFAULT_MAX_PROMPT_BYTES = 2_000_000
@@ -58,10 +59,15 @@ function renderBlock(block: ContentBlock): string {
       return `<tool_result call_id="${escapeAttr(block.toolCallId)}"`
         + ` is_error="${block.isError === true}">${body}</tool_result>`
     }
-    case 'image':
-      // Declared as text-only by `listModels`, so this is unreachable through
-      // normal routing; rendering a placeholder beats emitting nothing at all.
-      return '<image note="images are not supported by the claude-cli provider" />'
+    case 'image': {
+      // Only reachable for images left behind by `splitTrailingImages` — an
+      // older turn, or a turn that is not the user's. The bytes are not resent,
+      // so the note stands in for them and says why rather than pretending the
+      // block was never there.
+      const name = block.attachment.name
+      return `<image${name === undefined ? '' : ` name="${escapeAttr(name)}"`}`
+        + ' note="sent earlier in this conversation; bytes not resent" />'
+    }
     default:
       return `<unsupported_block type="${escapeText(String((block as { type: string }).type))}" />`
   }
@@ -73,12 +79,57 @@ function renderMessage(message: Message): string {
   return `<${message.role}>\n${body}\n</${message.role}>`
 }
 
+/**
+ * Split the image blocks off the newest turn.
+ *
+ * Only the last message, and only when it is the user's: those are the bytes
+ * the caller is asking about right now, and they are the ones the SDK's
+ * streaming-input channel can carry natively. Images further back stay in the
+ * document as notes — resending every image on every turn would put the whole
+ * conversation's base64 on the wire each round.
+ *
+ * @param messages - the ordered conversation.
+ * @returns the conversation with the newest turn's images removed, and those images.
+ */
+function splitTrailingImages(messages: readonly Message[]): {
+  messages: readonly Message[]
+  images: readonly ImageAttachmentRef[]
+} {
+  const last = messages.at(-1)
+  if (last === undefined || last.role !== 'user') return { messages, images: [] }
+
+  const images: ImageAttachmentRef[] = []
+  /** Remove image blocks at any depth, collecting them in encounter order. */
+  const strip = (block: ContentBlock): readonly ContentBlock[] => {
+    if (block.type === 'image') {
+      images.push(block.attachment)
+      return []
+    }
+    // Tool results nest their own blocks, and that is where `read_image` puts
+    // the bytes: a text envelope plus an image block. Scanning only the top
+    // level left exactly that case rendering as a note about missing bytes.
+    if (block.type === 'tool-result') {
+      return [{ ...block, content: block.content.flatMap(strip) }]
+    }
+    return [block]
+  }
+
+  const content = last.content.flatMap(strip)
+  if (images.length === 0) return { messages, images: [] }
+  return { messages: [...messages.slice(0, -1), { ...last, content } as Message], images }
+}
+
 /** What the transport needs to send, after flattening and budgeting. */
 export interface RenderedRequest {
   /** The full conversation document. */
   prompt: string
   /** Whether history had to be dropped to fit the budget. */
   truncated: boolean
+  /**
+   * Images from the newest user turn, carried outside the document so a
+   * transport with a native channel can send the real bytes.
+   */
+  images: readonly ImageAttachmentRef[]
 }
 
 /** Knobs for one render. */
@@ -104,11 +155,12 @@ export function renderConversation(
   options: RenderOptions = {},
 ): RenderedRequest {
   const budget = options.maxPromptBytes ?? DEFAULT_MAX_PROMPT_BYTES
-  const chunks = messages.map(renderMessage)
+  const { messages: pending, images } = splitTrailingImages(messages)
+  const chunks = pending.map(renderMessage)
 
   const total = chunks.reduce((sum, chunk) => sum + byteLength(chunk) + 1, 0)
   if (total <= budget) {
-    return { prompt: wrap(chunks), truncated: false }
+    return { prompt: wrap(chunks), truncated: false, images }
   }
 
   // Walk backwards: the newest turns are the ones the model actually needs, and
@@ -124,7 +176,7 @@ export function renderConversation(
     kept.unshift(chunk)
     used += cost
   }
-  return { prompt: wrap([TRUNCATION_NOTICE, ...kept]), truncated: true }
+  return { prompt: wrap([TRUNCATION_NOTICE, ...kept]), truncated: true, images }
 }
 
 /** Wrap the rendered turns in the outer conversation element. */

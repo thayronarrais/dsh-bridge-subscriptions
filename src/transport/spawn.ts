@@ -115,6 +115,16 @@ export async function* streamViaSpawn(request: TransportRequest): AsyncIterable<
       UNSUPPORTED_OPTION_CODE,
     )
   }
+  if ((request.images ?? []).length > 0) {
+    // Unreachable through normal routing, since the adapter only declares image
+    // input on the SDK transport. Refused rather than sent as prose about bytes
+    // that never arrived, for the same reason tools are.
+    throw new LlmError(
+      'claude-cli: the spawn transport cannot carry images — the prompt travels as text over stdin.'
+      + ' Set `transport: sdk` for sessions with attachments.',
+      UNSUPPORTED_OPTION_CODE,
+    )
+  }
 
   const translator = new StreamTranslator()
   const stderr = { text: '' }

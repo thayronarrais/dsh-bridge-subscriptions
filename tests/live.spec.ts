@@ -12,8 +12,10 @@
  * Code's own ToolSearch.
  */
 import { describe, expect, it } from 'vitest'
-import { createUserMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import { CallId, createAssistantMessage, createToolResultMessage, createUserMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, StreamChunk, ToolSchema } from '@deepseek-ai/dsh-llm'
+import { AttachmentId } from '@deepseek-ai/dsh-attachment'
+import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import { ClaudeCliAdapter } from '../src/adapter.ts'
 import type { ClaudeCliConnection } from '../src/adapter.ts'
 import { EFFORT_LEVELS } from '../src/effort.ts'
@@ -155,5 +157,109 @@ describe.skipIf(!LIVE)('live: Claude Code CLI', () => {
   it('recusa stop sequences em vez de ignora-las em silencio', () => {
     expect(() => adapter().stream(request('hi', { stop: ['\n\n'] })))
       .toThrowError(expect.objectContaining({ code: 'UNSUPPORTED_OPTION' }) as never)
+  })
+})
+
+/** A 64x64 solid red PNG, generated deterministically so the assertion has a known answer. */
+const RED_SQUARE_PNG = 'iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAb0lEQVR4nO3PAQkAAAyEwO9feoshgnABdLep8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3IPanc8OLDQitxAAAAAElFTkSuQmCC'
+
+const RED_SQUARE_REF: ImageAttachmentRef = {
+  attachmentId: AttachmentId('live-red-square'),
+  mediaType: 'image/png',
+  bytes: 168,
+  width: 64,
+  height: 64,
+  name: 'red.png',
+}
+
+/** An adapter whose attachment reader serves the one image these tests use. */
+function imageAdapter(): ClaudeCliAdapter {
+  return new ClaudeCliAdapter({
+    connection: () => CONNECTION,
+    readImage: () => (ref) => Promise.resolve({
+      ref,
+      data: new Uint8Array(Buffer.from(RED_SQUARE_PNG, 'base64')),
+    }),
+  })
+}
+
+function imageRequest(text: string, extra: Partial<GenerateOptions> = {}): GenerateOptions {
+  return {
+    provider: 'claude-cli',
+    model: 'sonnet',
+    messages: [createUserMessage({
+      content: [{ type: 'text', text }, { type: 'image', attachment: RED_SQUARE_REF }],
+      source: { kind: 'user' },
+    })],
+    ...extra,
+  }
+}
+
+function textOf(chunks: readonly StreamChunk[]): string {
+  return chunks
+    .flatMap((chunk) => chunk.type === 'text-delta' ? [chunk.text] : [])
+    .join('')
+}
+
+describe.skipIf(!LIVE)('live: entrada de imagem', () => {
+  it('o modelo enxerga os bytes da imagem, nao um placeholder', { timeout: 180_000 }, async () => {
+    const chunks = await collect(imageAdapter().stream(
+      imageRequest('Responda com UMA palavra: qual e a cor predominante desta imagem?'),
+    ))
+    expect(textOf(chunks).toLowerCase()).toMatch(/red|vermelh/)
+  })
+
+  it('mantem a contencao no modo streaming-input: a tool do harness ainda chega ao modelo', {
+    timeout: 180_000,
+  }, async () => {
+    // O risco real da mudanca: trocar o prompt string por um iterable poderia
+    // fazer as Options de contencao pararem de valer. Se a tool chega, elas valem.
+    const chunks = await collect(imageAdapter().stream(imageRequest(
+      'Chame a tool get_weather para Sao Paulo. Nao responda em prosa.',
+      { tools: [WEATHER_TOOL] },
+    )))
+    const toolCalls = chunks
+      .filter((c): c is Extract<StreamChunk, { type: 'block-end' }> => c.type === 'block-end')
+      .map((c) => c.block)
+      .filter((block) => block.type === 'tool-call')
+    expect(toolCalls.map((call) => (call as { name: string }).name)).toContain('get_weather')
+  })
+})
+
+describe.skipIf(!LIVE)('live: imagem vinda de tool result', () => {
+  it('enxerga os bytes que o read_image entrega aninhados no tool result', {
+    timeout: 180_000,
+  }, async () => {
+    // Reproduz o formato real do host: envelope de texto + bloco de imagem,
+    // ambos dentro do tool-result. Foi exatamente esse caminho que voltou
+    // placeholder na primeira versao da feature.
+    const chunks = await collect(imageAdapter().stream({
+      provider: 'claude-cli',
+      model: 'sonnet',
+      messages: [
+        createUserMessage({
+          content: [{ type: 'text', text: 'Leia red.png e diga a cor predominante em UMA palavra.' }],
+          source: { kind: 'user' },
+        }),
+        createAssistantMessage({
+          content: [{
+            type: 'tool-call',
+            id: CallId('toolu_live_1'),
+            name: 'read_image',
+            arguments: '{"file_path":"red.png"}',
+          }],
+          source: { provider: 'claude-cli', model: 'sonnet' },
+        }),
+        createToolResultMessage({
+          callId: CallId('toolu_live_1'),
+          content: [
+            { type: 'text', text: 'image/png image, 64x64 px, 168 bytes' },
+            { type: 'image', attachment: RED_SQUARE_REF },
+          ],
+          isError: false,
+        }),
+      ],
+    }))
+    expect(textOf(chunks).toLowerCase()).toMatch(/red|vermelh/)
   })
 })

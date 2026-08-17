@@ -216,11 +216,11 @@ Claude Code reports plan limits in prose, not as an HTTP status. A five-hour or 
 These are design consequences, not unfinished work.
 
 - **No attribution headers.** `LlmAdapter` requires every provider HTTP request to carry `attributionHeaders()`. This bridge issues no HTTP of its own — the official CLI talks to Anthropic and sends its own `User-Agent`, with no override. Satisfying the contract would mean proxying the subscription credential directly, which is exactly what this plugin refuses to do.
-- **Text only.** The CLI takes a text prompt, so `listModels`/`resolveModel` declare `inputModalities: ['text']`. Images are refused rather than silently dropped.
+- **Images only on the newest turn, and only on `sdk`.** The Agent SDK's streaming-input prompt is the one channel that carries image bytes, so `listModels`/`resolveModel` declare `inputModalities: ['text', 'image']` only when `transport: sdk` *and* the host mounts the attachment service; otherwise they declare `['text']` and the harness refuses images at the tool boundary. Only the newest user turn's images are sent as bytes — resending every image on every turn would put the whole conversation's base64 on the wire each round — so images further back stay in the flattened document as `<image … note="sent earlier in this conversation; bytes not resent" />`.
 - **No stop sequences.** The CLI exposes no stop-sequence option. Because ignoring `stop` would change what the model may produce without the caller knowing, the request is refused with `UNSUPPORTED_OPTION`.
 - **`temperature` and `maxTokens` are ignored**, with one warning per adapter instance. They have no CLI equivalent at all, and failing every request over an advisory shaping hint would make the provider useless.
 - **Fixed overhead.** Claude Code injects roughly 28k tokens of its own context per call — measured on a plain text request with the system prompt replaced and no tools published. It is prompt-cached, so after the first call it shows up as `cacheReadTokens` rather than fresh input, but it cannot be removed.
-- **The `spawn` transport is text-only.** The MCP bridge is an in-process server object and cannot cross a process boundary, and the installed CLI exposes no `--max-turns`. A call carrying tools is refused instead of degrading to prose.
+- **The `spawn` transport is text-only.** The MCP bridge is an in-process server object and cannot cross a process boundary, the prompt travels as text over stdin, and the installed CLI exposes no `--max-turns`. A call carrying tools or images is refused instead of degrading to prose.
 
 ## Roadmap
 

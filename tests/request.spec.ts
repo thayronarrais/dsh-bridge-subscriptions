@@ -1,11 +1,34 @@
 import { describe, expect, it } from 'vitest'
 import { createAssistantMessage, createToolResultMessage, createUserMessage, CallId } from '@deepseek-ai/dsh-llm'
 import type { Message } from '@deepseek-ai/dsh-llm'
+import { AttachmentId } from '@deepseek-ai/dsh-attachment'
+import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import { buildSystemPrompt, renderConversation } from '../src/translate/request.ts'
 import { namespaceToolName, unnamespaceToolName } from '../src/translate/tools.ts'
 
 function user(text: string): Message {
   return createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } })
+}
+
+function imageRef(id: string, name?: string): ImageAttachmentRef {
+  return {
+    attachmentId: AttachmentId(id),
+    mediaType: 'image/png',
+    bytes: 4,
+    width: 1,
+    height: 1,
+    ...name === undefined ? {} : { name },
+  }
+}
+
+function userWithImages(text: string, ...refs: readonly ImageAttachmentRef[]): Message {
+  return createUserMessage({
+    content: [
+      { type: 'text', text },
+      ...refs.map((attachment) => ({ type: 'image' as const, attachment })),
+    ],
+    source: { kind: 'user' },
+  })
 }
 
 function assistant(text: string): Message {
@@ -71,6 +94,56 @@ describe('renderConversation', () => {
     const { prompt, truncated } = renderConversation([user('x'.repeat(5000))], { maxPromptBytes: 100 })
     expect(truncated).toBe(true)
     expect(prompt).toContain('x'.repeat(5000))
+  })
+
+  it('separa as imagens da ultima mensagem do usuario em vez de descarta-las', () => {
+    const ref = imageRef('att-1')
+    const { prompt, images } = renderConversation([userWithImages('o que e isso?', ref)])
+    expect(images).toEqual([ref])
+    // O bloco saiu do documento: os bytes viajam pelo canal nativo do SDK.
+    expect(prompt).not.toContain('<image')
+    expect(prompt).toContain('o que e isso?')
+  })
+
+  it('deixa as imagens de turnos anteriores como nota, sem reenviar os bytes', () => {
+    const antiga = imageRef('att-antiga', 'print.png')
+    const nova = imageRef('att-nova')
+    const { prompt, images } = renderConversation([
+      userWithImages('olha isso', antiga),
+      assistant('vi'),
+      userWithImages('e agora?', nova),
+    ])
+    expect(images).toEqual([nova])
+    expect(prompt).toContain('<image name="print.png"')
+    // A nota nao pode mais dizer que o provider recusa imagens: ele aceita.
+    expect(prompt).not.toContain('not supported')
+  })
+
+  it('nao trata como anexo do turno atual a imagem de uma mensagem que nao e do usuario', () => {
+    const ref = imageRef('att-1')
+    const { images } = renderConversation([userWithImages('olha', ref), assistant('vi')])
+    expect(images).toEqual([])
+  })
+
+  it('separa a imagem aninhada no tool result, que e como o read_image entrega', () => {
+    // O read_image do host devolve dois blocos dentro do tool-result: um
+    // envelope de texto e o bloco de imagem. Varrer so o topo da mensagem
+    // deixava os bytes virarem placeholder.
+    const ref = imageRef('att-lida')
+    const message = createToolResultMessage({
+      callId: CallId('toolu_1'),
+      content: [
+        { type: 'text', text: 'image/png image, 1200x900 px, 98303 bytes' },
+        { type: 'image', attachment: ref },
+      ],
+      isError: false,
+    })
+    const { prompt, images } = renderConversation([message])
+    expect(images).toEqual([ref])
+    expect(prompt).not.toContain('<image')
+    // O envelope de texto continua no documento, correlacionado com a chamada.
+    expect(prompt).toContain('<tool_result call_id="toolu_1"')
+    expect(prompt).toContain('1200x900 px')
   })
 
   it('mede o orcamento em bytes, nao em caracteres', () => {

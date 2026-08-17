@@ -70,6 +70,20 @@ describe('plugin composition', () => {
     expect(models.every((m) => m.inputModalities?.includes('image') !== true)).toBe(true)
   })
 
+  it('declara entrada de imagem quando o servico de anexos esta montado', async () => {
+    // O inject de `attachments` e opcional: e a presenca dele, em runtime, que
+    // separa uma rota text-only de uma que sabe ler imagem.
+    const ctx = new Context()
+    context = ctx
+    await ctx.plugin(LlmRuntime)
+    ctx.provide('attachments', {
+      readImage: () => Promise.reject(new Error('os bytes nao sao lidos neste teste')),
+    } as never)
+    await ctx.plugin(BridgePlugin, { claude: { discoverModels: false } })
+    const models = await ctx.llm.listModels(PROVIDER)
+    expect(models.every((m) => m.inputModalities?.includes('image') === true)).toBe(true)
+  })
+
   it('respeita um catalogo customizado vindo da config', async () => {
     const ctx = await mount({
       claude: { models: [{ id: 'sonnet', name: 'Only Sonnet', contextWindow: 123_456 }] },

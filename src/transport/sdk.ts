@@ -14,7 +14,7 @@
  */
 
 import { query } from '@anthropic-ai/claude-agent-sdk'
-import type { Options, SDKMessage } from '@anthropic-ai/claude-agent-sdk'
+import type { Options, SDKMessage, SDKUserMessage } from '@anthropic-ai/claude-agent-sdk'
 import { LlmError } from '@deepseek-ai/dsh-llm'
 import type { StreamChunk } from '@deepseek-ai/dsh-llm'
 import { classifyFailure, classifyThrown, STREAM_IDLE_TIMEOUT_CODE, toFailure } from '../errors.ts'
@@ -61,6 +61,39 @@ function containmentOptions(request: TransportRequest): Options {
 }
 
 /**
+ * Choose the prompt form this call needs.
+ *
+ * The SDK accepts either a string or a stream of user messages, and only the
+ * second can carry image bytes. A text-only call keeps the string: switching
+ * every request to streaming input to serve the rare one with an attachment
+ * would put the common path on a code route nothing exercises.
+ *
+ * The returned iterable yields exactly one message and completes, which is what
+ * ends the turn — the harness owns the loop, so there is never a second message.
+ *
+ * @param request - the prepared provider call.
+ * @returns the flattened document, or a one-message stream carrying it plus the images.
+ */
+export function buildSdkPrompt(request: TransportRequest): string | AsyncIterable<SDKUserMessage> {
+  const images = request.images ?? []
+  if (images.length === 0) return request.prompt
+  const content = [
+    { type: 'text' as const, text: request.prompt },
+    ...images.map((image) => ({
+      type: 'image' as const,
+      source: { type: 'base64' as const, media_type: image.mediaType, data: image.data },
+    })),
+  ]
+  return (async function* () {
+    yield {
+      type: 'user' as const,
+      message: { role: 'user' as const, content },
+      parent_tool_use_id: null,
+    }
+  })()
+}
+
+/**
  * Stream one call through the Agent SDK.
  * @param request - the prepared provider call.
  * @returns harness chunks, terminating in exactly one `finish`.
@@ -98,7 +131,7 @@ export async function* streamViaSdk(request: TransportRequest): AsyncIterable<St
 
   try {
     const messages = withIdleTimeout(
-      query({ prompt: request.prompt, options }) as AsyncIterable<SDKMessage>,
+      query({ prompt: buildSdkPrompt(request), options }) as AsyncIterable<SDKMessage>,
       request.idleTimeoutMs,
       () => new LlmError(
         `claude-cli: no output from the Claude Code CLI for ${request.idleTimeoutMs}ms`,
