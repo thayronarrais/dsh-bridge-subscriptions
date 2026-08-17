@@ -39,6 +39,13 @@ export type { ClaudeCliModel } from './model.ts'
 export { StreamTranslator } from './translate/events.ts'
 
 export const name = 'bridge-subscriptions'
+/**
+ * `attachments` is deliberately absent. Cordis `inject` has no optional form —
+ * listing it would park this whole bridge on a host that mounts no attachment
+ * service, when the right outcome there is a working text-only route. It is
+ * read through `ctx.get('attachments')` instead, which answers `undefined`
+ * rather than waiting.
+ */
 export const inject = ['llm']
 
 const NS = settingsNamespace('bridge-subscriptions')
@@ -251,6 +258,13 @@ export function apply(ctx: Context, config: Config): void {
     logger: {
       warn: (message) => ctx.logger.warn(message),
       debug: (message) => ctx.logger.debug(message),
+    },
+    // Resolved through `ctx` on every call rather than captured once: an
+    // optional service can arrive or leave while this plugin is loaded, and the
+    // modality the route declares follows it.
+    readImage: () => {
+      const store = ctx.get('attachments')
+      return store === undefined ? undefined : (ref) => store.readImage(ref)
     },
   })
 

@@ -6,7 +6,21 @@
  */
 
 import type { StreamChunk, ToolSchema } from '@deepseek-ai/dsh-llm'
+import type { ImageMediaType } from '@deepseek-ai/dsh-attachment'
 import type { EffortLevel } from '../effort.ts'
+
+/**
+ * One image resolved to bytes, ready for a transport with a native channel.
+ *
+ * The adapter does the resolving because it owns the attachment seam; a
+ * transport receives only what it can put on the wire.
+ */
+export interface TransportImage {
+  /** Verified media type; the vocabulary already matches what the API accepts. */
+  mediaType: ImageMediaType
+  /** Base64-encoded encoded bytes. */
+  data: string
+}
 
 /** Minimal logging surface, satisfied by the Cordis logger. */
 export interface TransportLogger {
@@ -26,6 +40,12 @@ export interface TransportRequest {
   effort?: EffortLevel
   /** Tool schemas to publish through the MCP bridge; empty disables the bridge. */
   tools: readonly ToolSchema[]
+  /**
+   * Images belonging to the newest user turn. Absent or empty keeps the call on
+   * the plain string-prompt path; a transport that cannot carry bytes refuses a
+   * non-empty list rather than dropping it.
+   */
+  images?: readonly TransportImage[]
   /** Caller cancellation. */
   signal?: AbortSignal
   /** Override for the `claude` executable. */

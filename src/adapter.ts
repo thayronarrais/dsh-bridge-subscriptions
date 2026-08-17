@@ -15,6 +15,7 @@ import type {
   ResolvedRetryPolicy,
   StreamChunk,
 } from '@deepseek-ai/dsh-llm'
+import type { ImageAttachmentRef, StoredImageAttachment } from '@deepseek-ai/dsh-attachment'
 import { ModelCatalog } from './catalog.ts'
 import { EFFORT_DISPLAY, isEffortLevel } from './effort.ts'
 import type { EffortLevel } from './effort.ts'
@@ -64,7 +65,20 @@ export interface ClaudeCliAdapterOptions {
   catalog?: ModelCatalog
   /** Injected by tests to observe the assembled request without spawning a CLI. */
   transports?: Partial<Record<TransportKind, Transport>>
+  /**
+   * Resolves the attachment reader for right now, or `undefined` while the
+   * service is not mounted.
+   *
+   * Re-read on every call for the same reason `connection` is: `attachments` is
+   * an optional inject, so it can arrive or leave during this plugin's life, and
+   * the modality this route declares has to follow it rather than a snapshot
+   * taken at construction.
+   */
+  readImage?: () => ImageReader | undefined
 }
+
+/** Reads the bytes behind one durable attachment reference. */
+export type ImageReader = (ref: ImageAttachmentRef) => Promise<StoredImageAttachment>
 
 const TRANSPORTS: Record<TransportKind, Transport> = {
   sdk: streamViaSdk,
@@ -102,6 +116,25 @@ export class ClaudeCliAdapter extends LlmAdapter {
     this.#catalog.invalidate()
   }
 
+  /**
+   * Whether this route can actually put image bytes on the wire right now.
+   *
+   * Both halves are required and both are runtime facts, so this is asked per
+   * call rather than captured: the SDK transport is the only one with a native
+   * image channel, and the bytes only exist if the attachment service is mounted.
+   * Declaring the capability without either one would turn a clear refusal at
+   * the tool boundary into a silent, image-shaped hole in the prompt.
+   */
+  #imageCapable(): boolean {
+    return this.#options.connection().transport === 'sdk'
+      && this.#options.readImage?.() !== undefined
+  }
+
+  /** The modality list both catalog methods must agree on. */
+  #inputModalities(): readonly ['text'] | readonly ['text', 'image'] {
+    return this.#imageCapable() ? ['text', 'image'] as const : ['text'] as const
+  }
+
   override providerInfo(provider: string): LlmProviderInfo {
     return { id: provider, name: 'Claude Code (subscription)' }
   }
@@ -117,9 +150,7 @@ export class ClaudeCliAdapter extends LlmAdapter {
       id: model.id,
       name: model.name ?? model.id,
       ...model.description === undefined ? {} : { description: model.description },
-      // Explicit negative capability: the CLI takes a text prompt, and the
-      // adapter has nowhere to put image bytes.
-      inputModalities: ['text'] as const,
+      inputModalities: this.#inputModalities(),
     }))
   }
 
@@ -139,7 +170,7 @@ export class ClaudeCliAdapter extends LlmAdapter {
       id: model,
       name: known?.name ?? model,
       ...known?.description === undefined ? {} : { description: known.description },
-      inputModalities: ['text'] as const,
+      inputModalities: this.#inputModalities(),
       context: { contextWindow: known?.contextWindow ?? connection.defaultContextWindow },
       ...known?.maxTokens === undefined ? {} : { defaultMaxTokens: known.maxTokens },
       ...reasoning === undefined ? {} : { reasoning },
@@ -182,7 +213,7 @@ export class ClaudeCliAdapter extends LlmAdapter {
     const connection = this.#options.connection()
     this.#rejectUnsupported(options)
 
-    const { prompt, truncated } = renderConversation(options.messages, {
+    const { prompt, truncated, images } = renderConversation(options.messages, {
       maxPromptBytes: connection.maxPromptBytes,
     })
     if (truncated) {
@@ -209,7 +240,20 @@ export class ClaudeCliAdapter extends LlmAdapter {
 
     const transport = this.#options.transports?.[connection.transport]
       ?? TRANSPORTS[connection.transport]
-    return transport(request)
+
+    const readImage = this.#options.readImage?.()
+    if (images.length === 0 || readImage === undefined) return transport(request)
+
+    // Reading bytes is async, but `stream()` must stay synchronous: callers rely
+    // on an invalid request being refused before iteration starts. So the reads
+    // happen inside the generator, after validation has already had its say.
+    return (async function* () {
+      const resolved = await Promise.all(images.map(async (ref) => {
+        const stored = await readImage(ref)
+        return { mediaType: stored.ref.mediaType, data: Buffer.from(stored.data).toString('base64') }
+      }))
+      yield* transport({ ...request, images: resolved })
+    })()
   }
 
   /**
